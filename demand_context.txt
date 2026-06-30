@@ -1,0 +1,14 @@
+### Demand context the agent perceives — the external signals a human planner
+### would read before deciding how much to reorder. Free text, on purpose.
+
+[WEATHER]
+A heatwave is forecast across the region for next week, with temperatures
+10-12 degrees above seasonal norms. Cold-beverage demand typically spikes.
+
+[CALENDAR]
+The July 4th holiday weekend falls in 5 days. Historically our highest-volume
+weekend of the summer for sparkling water and energy drinks.
+
+[NOTE — sales]
+Energy drink sales have been trending up ~15% month over month even before
+these events.
