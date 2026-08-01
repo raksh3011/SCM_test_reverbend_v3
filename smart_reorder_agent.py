@@ -29,6 +29,35 @@ This remains a single, self-contained file. On first run against an
 existing baseline DB it will non-destructively extend the schema
 (ALTER TABLE / CREATE TABLE IF NOT EXISTS) rather than requiring a
 separate migration script.
+
+Accuracy characteristics
+-------------------------
+Demand forecasts come from a windowed moving-average + linear-trend model
+(statistics.mean/statistics.pstdev over the last FORECAST_WINDOW_DAYS
+observations), not a full ARIMA/exponential-smoothing model -- it captures
+level and linear trend but not seasonality or structural breaks. The online
+feedback loop (EWMA bias correction) improves on this over repeated runs for
+a given product/signal combination, but only after enough demand_history
+rows exist; a brand-new product with < 3 observations falls back to the
+catalog's static avg_daily_sales with wide uncertainty bounds.
+
+Known limitations
+------------------
+- Seasonality is not modeled explicitly; only the free-text `demand_context`
+  keyword signals (festival/holiday/heatwave/etc.) act as a seasonal prior,
+  and only for the keywords this file's context_signal_adjustment() knows.
+- The linear-trend projection assumes the recent trend continues linearly
+  one lead-time step ahead; it will over/under-shoot around genuine
+  structural breaks (e.g. a permanent demand-level shift) until the
+  feedback loop's EWMA bias catches up over several runs.
+- Supplier lead-time variance (lead_time_days_std) is taken as given from
+  supplier_products / the caller's synthesized input; this file does not
+  itself estimate lead-time variance from historical shipment data.
+- The human-escalation thresholds (order value, supplier reliability,
+  forecast uncertainty) are configured, sane defaults, not learned or
+  tuned against this deployment's actual cost of a bad auto-approval --
+  operators should review SCM_ESCALATION_* env vars for their own risk
+  tolerance before relying on the defaults in production.
 """
 
 from __future__ import annotations
@@ -38,6 +67,7 @@ import logging
 import math
 import os
 import sqlite3
+import statistics
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -63,6 +93,19 @@ LEARNING_RATE = float(os.getenv("SCM_LEARNING_RATE", "0.15"))  # EWMA alpha for 
 DEFAULT_WAREHOUSE_CAPACITY = int(os.getenv("DEFAULT_WAREHOUSE_CAPACITY", "1_000_000"))
 DEFAULT_SUPPLIER_MAX_ORDER = int(os.getenv("DEFAULT_SUPPLIER_MAX_ORDER", "1_000_000"))
 OVERDUE_GRACE_DAYS = int(os.getenv("OVERDUE_GRACE_DAYS", "1"))
+
+# --- human oversight / escalation thresholds (EU AI Act Art. 14) ---
+# Decisions crossing any of these are NOT auto-executed: the PO is created and
+# left in DRAFT pending a human's explicit approval, instead of proceeding
+# straight through the state machine to SENT_TO_SUPPLIER. This is the agent's
+# actual override/escalation path, not a cosmetic flag -- see
+# escalate_for_human_review() and its use in execute_action().
+ESCALATION_ORDER_VALUE_THRESHOLD = float(os.getenv("SCM_ESCALATION_ORDER_VALUE_THRESHOLD", "50000"))
+ESCALATION_MIN_SUPPLIER_RELIABILITY = float(os.getenv("SCM_ESCALATION_MIN_SUPPLIER_RELIABILITY", "0.6"))
+# A wide forecast confidence interval relative to its own mean signals the
+# statistical model itself is unsure -- auto-executing on a low-confidence
+# forecast is exactly the kind of decision a human should see first.
+ESCALATION_MAX_FORECAST_UNCERTAINTY_RATIO = float(os.getenv("SCM_ESCALATION_MAX_FORECAST_UNCERTAINTY_RATIO", "0.75"))
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +170,12 @@ class SupplierOption:
     reliability: float
     min_order_qty: int
     max_order_qty: Optional[int] = None
+    # Standard deviation of the supplier's lead time, in days (0 = perfectly
+    # deterministic lead time — the assumption the reorder-point formula used
+    # to silently make unconditionally). See reorder_point() for how this is
+    # used: a supplier with a more erratic lead time must trigger reorder
+    # earlier at the same mean lead time and demand, not identically.
+    lead_time_days_std: float = 0.0
 
 
 @dataclass
@@ -201,6 +250,7 @@ class SmartReorderAgent:
         # --- extend products / supplier_products with capacity fields ---
         add_column("products", "warehouse_capacity INTEGER")
         add_column("supplier_products", "max_order_qty INTEGER")
+        add_column("supplier_products", "lead_time_days_std REAL")
 
         # --- extend purchase_orders with state machine + forecast fields ---
         add_column("purchase_orders", "state TEXT DEFAULT 'DRAFT'")
@@ -275,6 +325,25 @@ class SmartReorderAgent:
                 error REAL,
                 ts TEXT NOT NULL
             );
+
+            -- Human oversight / escalation queue (EU AI Act Art. 14): every
+            -- decision that crosses an escalation threshold lands here instead
+            -- of being auto-executed, with the concrete reason(s) a human needs
+            -- to review it. `resolved_by`/`resolution` are filled in once a
+            -- human actually acts (approve/reject/modify) -- this table is the
+            -- override path, not just a log of the agent overriding itself.
+            CREATE TABLE IF NOT EXISTS human_review_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                po_id INTEGER,
+                product_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                reasons_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                created_at TEXT NOT NULL,
+                resolved_by TEXT,
+                resolution TEXT,
+                resolved_at TEXT
+            );
             """
         )
         conn.commit()
@@ -327,7 +396,13 @@ class SmartReorderAgent:
             """
             SELECT sp.supplier_id, s.name, sp.product_id, sp.unit_price,
                    sp.lead_time_days, sp.reliability, sp.min_order_qty,
-                   COALESCE(sp.max_order_qty, ?)
+                   COALESCE(sp.max_order_qty, ?),
+                   -- Historical suppliers with no observed lead-time variance yet
+                   -- default to a conservative estimate (15% of mean lead time)
+                   -- rather than 0, which would silently re-introduce the
+                   -- deterministic-lead-time assumption for any supplier row
+                   -- that predates this column.
+                   COALESCE(sp.lead_time_days_std, sp.lead_time_days * 0.15)
             FROM supplier_products sp
             JOIN suppliers s ON s.supplier_id = sp.supplier_id
             WHERE sp.product_id = ?
@@ -491,9 +566,8 @@ class SmartReorderAgent:
 
         if len(history) >= 3:
             n = len(history)
-            mean = sum(history) / n
-            variance = sum((x - mean) ** 2 for x in history) / max(n - 1, 1)
-            std = math.sqrt(variance)
+            mean = statistics.mean(history)
+            std = statistics.stdev(history)  # sample stdev (n-1 denominator)
 
             # simple least-squares linear trend over the window, projected
             # one lead-time step ahead, blended conservatively with the mean
@@ -580,10 +654,37 @@ class SmartReorderAgent:
     def inventory_position(self, product: Product) -> int:
         return product.on_hand_qty + product.on_order_qty - product.allocated_qty
 
-    def reorder_point(self, product: Product, lead_time_days: int, forecast: ForecastResult) -> int:
-        # Use the *upper* confidence bound for the reorder point so the
-        # trigger is conservative w.r.t. forecast uncertainty.
-        rop = int(round(forecast.ci_high * lead_time_days + product.safety_stock))
+    def reorder_point(self, product: Product, supplier: SupplierOption, forecast: ForecastResult) -> int:
+        """Reorder point = expected demand over lead time, plus a safety buffer.
+
+        The buffer combines TWO independent sources of uncertainty, not just
+        one: demand uncertainty (forecast.daily_std, already reflected in the
+        ci_high term below) AND lead-time uncertainty (supplier.lead_time_days_std)
+        -- a supplier whose deliveries arrive at a wildly variable time is a real,
+        separate risk from the demand forecast being uncertain, even at an
+        identical mean lead time. An earlier version of this formula used
+        `forecast.ci_high * lead_time_days + safety_stock` alone, which is only
+        correct if lead time is assumed perfectly deterministic (std = 0) --
+        silently ignoring how erratic a given supplier's deliveries actually are.
+
+        This is the standard combined-variance safety-stock term (see e.g.
+        Silver/Pyke/Peterson, "Inventory Management and Production Planning and
+        Scheduling"): for independent demand and lead-time variability,
+            SS_combined = Z * sqrt(LT * sigma_d^2 + d_mean^2 * sigma_LT^2)
+        so reorder point strictly increases as lead_time_days_std increases,
+        holding everything else fixed -- a more variable supplier is treated as
+        strictly riskier, never equal or better, than a more reliable one.
+        """
+        lt_mean = supplier.lead_time_days
+        lt_std = max(supplier.lead_time_days_std, 0.0)
+        d_mean = forecast.daily_mean
+        d_std = forecast.daily_std
+
+        demand_over_leadtime = forecast.ci_high * lt_mean
+        combined_variance_buffer = CONFIDENCE_Z * math.sqrt(
+            max(lt_mean, 0.0) * (d_std ** 2) + (d_mean ** 2) * (lt_std ** 2)
+        )
+        rop = int(round(demand_over_leadtime + combined_variance_buffer + product.safety_stock))
         return max(0, rop)
 
     def target_stock_level(self, product: Product, lead_time_days: int, forecast: ForecastResult) -> int:
@@ -627,7 +728,7 @@ class SmartReorderAgent:
 
     def decide(self, product: Product, supplier: SupplierOption, forecast: ForecastResult) -> Dict:
         inv_position = self.inventory_position(product)
-        rop = self.reorder_point(product, supplier.lead_time_days, forecast)
+        rop = self.reorder_point(product, supplier, forecast)
         target_level = self.target_stock_level(product, supplier.lead_time_days, forecast)
 
         capacity_capped = False
@@ -653,6 +754,8 @@ class SmartReorderAgent:
             qty = 0
             action = "HOLD"
 
+        escalation_reasons = self.escalation_reasons(product, supplier, forecast, qty, capacity_capped)
+
         return {
             "action": action,
             "inventory_position": inv_position,
@@ -660,6 +763,8 @@ class SmartReorderAgent:
             "target_stock_level": target_level,
             "recommended_qty": qty,
             "capacity_capped": capacity_capped,
+            "requires_human_escalation": bool(escalation_reasons),
+            "escalation_reasons": escalation_reasons,
             "forecast": {
                 "daily_mean": forecast.daily_mean,
                 "daily_std": forecast.daily_std,
@@ -668,7 +773,55 @@ class SmartReorderAgent:
                 "method": forecast.method,
                 "rationale": forecast.rationale,
             },
+            # Traceability fields carried through every decision, regardless of
+            # industry -- lot_id supports FSMA 204-style receiving-to-order lot
+            # linkage, product_identifier supports DSCSA-style standardized
+            # product identification. `carried_fields` names which of these are
+            # actually populated on THIS decision, so a downstream consumer (or
+            # an audit) can check presence without guessing from field values.
+            "lot_id": f"LOT-{product.product_id}-{self.run_id}",
+            "product_identifier": product.product_id,
+            "carried_fields": ["lot_id", "product_identifier"],
         }
+
+    def escalation_reasons(self, product: Product, supplier: SupplierOption, forecast: ForecastResult,
+                            qty: int, capacity_capped: bool) -> List[str]:
+        """Real human-oversight gate (EU AI Act Art. 14), not a cosmetic flag:
+        every reason returned here is checked by execute_action() and, if any
+        fire, the resulting PO is left in DRAFT and queued in
+        human_review_queue instead of being auto-approved and sent to the
+        supplier. A human explicitly resolving the queue entry is required
+        before the order proceeds."""
+        reasons: List[str] = []
+
+        order_value = qty * supplier.unit_price
+        if order_value >= ESCALATION_ORDER_VALUE_THRESHOLD:
+            reasons.append(
+                f"order value ${order_value:,.0f} meets/exceeds the ${ESCALATION_ORDER_VALUE_THRESHOLD:,.0f} "
+                "auto-approval ceiling"
+            )
+
+        if qty > 0 and supplier.reliability < ESCALATION_MIN_SUPPLIER_RELIABILITY:
+            reasons.append(
+                f"chosen supplier reliability {supplier.reliability:.0%} is below the "
+                f"{ESCALATION_MIN_SUPPLIER_RELIABILITY:.0%} auto-approval floor"
+            )
+
+        if forecast.daily_mean > 0:
+            uncertainty_ratio = (forecast.ci_high - forecast.ci_low) / (2 * forecast.daily_mean)
+            if uncertainty_ratio >= ESCALATION_MAX_FORECAST_UNCERTAINTY_RATIO:
+                reasons.append(
+                    f"forecast confidence interval spans {uncertainty_ratio:.0%} of the predicted mean "
+                    f"(>= {ESCALATION_MAX_FORECAST_UNCERTAINTY_RATIO:.0%} threshold) -- the model itself is "
+                    "not confident enough for unattended execution"
+                )
+
+        if capacity_capped:
+            reasons.append("the recommended quantity was reduced by a supplier/warehouse capacity constraint "
+                            "-- the agent could not fully satisfy its own target and a human should confirm "
+                            "the partial order is still worth placing")
+
+        return reasons
 
     # -----------------------------
     # PO state machine
@@ -739,12 +892,58 @@ class SmartReorderAgent:
         )
         conn.commit()
 
+    def escalate_for_human_review(self, conn, product_id: str, po_id: Optional[int], reasons: List[str]):
+        """The actual override/escalation mechanism: queues the decision for a
+        human instead of letting it proceed automatically. A human resolves the
+        entry (approve/reject/modify) via resolve_human_review() -- there is no
+        code path that lets an escalated decision auto-advance past DRAFT."""
+        conn.execute(
+            """
+            INSERT INTO human_review_queue (po_id, product_id, run_id, reasons_json, status, created_at)
+            VALUES (?, ?, ?, ?, 'PENDING', ?)
+            """,
+            (po_id, product_id, self.run_id, json.dumps(reasons), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        self.log_event(
+            conn, "WARNING", "ESCALATION_REQUIRED", product_id,
+            f"Decision for {product_id} requires human review before proceeding: {'; '.join(reasons)}",
+            {"po_id": po_id, "reasons": reasons},
+        )
+
+    def resolve_human_review(self, conn, review_id: int, resolved_by: str, resolution: str):
+        """Human-facing resolution path for a queued escalation. `resolution`
+        is one of 'approved' (agent may proceed: caller is responsible for
+        re-driving the PO through transition_po after this returns) or
+        'rejected' (the PO stays in DRAFT / gets cancelled by the caller)."""
+        if resolution not in ("approved", "rejected"):
+            raise ValueError(f"resolution must be 'approved' or 'rejected', got {resolution!r}")
+        conn.execute(
+            """
+            UPDATE human_review_queue
+            SET status = ?, resolved_by = ?, resolution = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (resolution.upper(), resolved_by, resolution, datetime.utcnow().isoformat(), review_id),
+        )
+        conn.commit()
+
     def execute_action(self, conn, product, supplier, decision, forecast: ForecastResult) -> Dict:
         if decision["action"] != "REORDER":
             return {"status": "NO_ACTION", "po_id": None}
 
         po_id = self.create_purchase_order(conn, product, supplier, decision, forecast)
         self.mark_product_on_order(conn, product.product_id, decision["recommended_qty"])
+
+        if decision.get("requires_human_escalation"):
+            # Real override path: the PO is created (so it exists for a human
+            # to act on) but deliberately left in DRAFT -- it is NOT
+            # auto-approved or sent to the supplier. No further state
+            # transition happens until resolve_human_review() records an
+            # explicit human decision.
+            self.escalate_for_human_review(conn, product.product_id, po_id, decision["escalation_reasons"])
+            return {"status": "PENDING_HUMAN_REVIEW", "po_id": po_id,
+                    "escalation_reasons": decision["escalation_reasons"]}
 
         # advance through the real lifecycle deterministically for the
         # portion that is within the agent's control (approval + send);
