@@ -779,7 +779,15 @@ class SmartReorderAgent:
             # product identification. `carried_fields` names which of these are
             # actually populated on THIS decision, so a downstream consumer (or
             # an audit) can check presence without guessing from field values.
-            "lot_id": f"LOT-{product.product_id}-{self.run_id}",
+            # Deterministic from decision-relevant inputs only (product + the
+            # actual numbers that drove this decision), NOT self.run_id --
+            # self.run_id is a fresh uuid per agent instantiation, so keying
+            # lot_id off it would make two back-to-back invocations of the
+            # exact same event produce a different lot_id despite an
+            # identical underlying decision, which looks like (and would be
+            # flagged as) non-deterministic/non-idempotent behavior even
+            # though the actual business decision never changed.
+            "lot_id": f"LOT-{product.product_id}-{rop}-{qty}",
             "product_identifier": product.product_id,
             "carried_fields": ["lot_id", "product_identifier"],
         }
